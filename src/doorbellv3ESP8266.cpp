@@ -7,8 +7,6 @@
  * mqtt
   */
 
-
-
 //Libs
 #include <Arduino.h>
 #include <RotaryDialer.h> // https://github.com/markfickett/Rotary-Dial
@@ -123,6 +121,7 @@ boolean bellOn = false;
 void ICACHE_RAM_ATTR buzzerButtonInterrupt();
 void ICACHE_RAM_ATTR doorBelInterrupt();
 
+
 // Wifi stuff
 const char thingName[] = "doorbell";
 const char wifiInitialApPassword[] = "10doorbell10!";
@@ -147,16 +146,22 @@ WiFiClient net;
 MQTTClient mqttClient;
 
 char mqttServerValue[STRING_LEN];
+char mqttUserNameValue[STRING_LEN];
+char mqttUserPasswordValue[STRING_LEN];
+
 
 IotWebConf iotWebConf(thingName, &dnsServer, &server, wifiInitialApPassword, CONFIG_VERSION);
 IotWebConfParameter mqttServerParam = IotWebConfParameter("MQTT server", "mqttServer", mqttServerValue, STRING_LEN);
-
+IotWebConfParameter mqttUserNameParam = IotWebConfParameter("MQTT user", "mqttUser", mqttUserNameValue, STRING_LEN);
+IotWebConfParameter mqttUserPasswordParam = IotWebConfParameter("MQTT password", "mqttPass", mqttUserPasswordValue, STRING_LEN, "password");
 boolean needMqttConnect = false;
 boolean needReset = false;
 unsigned long lastMqttConnectionAttempt = 0;
 int needAction = NO_ACTION;
 int state = LOW;
 unsigned long lastAction = 0;
+
+
 char mqttActionTopic[STRING_LEN];
 char mqttStatusTopic[STRING_LEN];
 
@@ -178,6 +183,8 @@ void setup(void) {
   //iotWebConf.setStatusPin(STATUS_PIN);
   //iotWebConf.setConfigPin(BUTTON_PIN);
   iotWebConf.addParameter(&mqttServerParam);
+  iotWebConf.addParameter(&mqttUserNameParam);
+  iotWebConf.addParameter(&mqttUserPasswordParam);
   iotWebConf.setConfigSavedCallback(&configSaved);
   iotWebConf.setFormValidator(&formValidator);
   iotWebConf.setWifiConnectionCallback(&wifiConnected);
@@ -188,6 +195,8 @@ void setup(void) {
   if (!validConfig)
   {
     mqttServerValue[0] = '\0';
+    mqttUserNameValue[0] = '\0';
+    mqttUserPasswordValue[0] = '\0';
   }
 
   // -- Set up required URL handlers on the web server.
@@ -243,18 +252,15 @@ void loop(void) {
           }
         }
         else if ((iotWebConf.getState() == IOTWEBCONF_STATE_ONLINE) && (!mqttClient.connected())) {
-          Serial.println("MQTT reconnect");
+          DEBUG_PRINTLN("MQTT reconnect");
           connectMqtt();
         }
 
         if (needReset) {
-          Serial.println("Rebooting after 1 second.");
+          DEBUG_PRINTLN("Rebooting after 1 second.");
           iotWebConf.delay(1000);
           ESP.restart();
         }
-
-
-
 
         if (dialer.update()) {
           newState = STATE_ROTARY_INPUT;
@@ -406,10 +412,13 @@ void loop(void) {
 
       // State 5 - Serial IN
       case STATE_SERIAL_INPUT:
+
         int input;
         input = Serial.parseInt();
         if (input > 0) {
           commandBuff.push(input);
+          DEBUG_PRINT("Serial input: ");
+          DEBUG_PRINTLN(input);
         }
         prevState = STATE_SERIAL_INPUT;
         newState = STATE_IDLE;
@@ -425,9 +434,51 @@ void loop(void) {
 
       // State 7 - Handle actio
       case STATE_HANDLE_ACTION:
+        prevState = STATE_HANDLE_ACTION;
         newState = STATE_IDLE; // Don get trapped in here
-        int command;
-        command = commandBuff.shift();
+        unsigned int iCommand, iTopic, iAction, iOutcome;
+        String strAction = "";
+        String strTopic = "";
+        String strOutcome = "";
+        iCommand = commandBuff.shift();
+        if(iCommand<10 || iCommand>99) {break;} // We are expecting two digits
+        iTopic = (iCommand/10) % 10;
+        iAction = (iCommand % 10);
+        switch(iAction) {
+          case 0:
+            strAction = "OFF";
+            break;
+          case 1:
+            strAction = "ON";
+            break;
+          case 2:
+            strAction = "TOGGLE";
+            break;
+          default:
+            strAction = "STATUS";
+            iAction = 9;
+            break;
+      }
+
+        switch(iTopic) {
+          case 5: // Unlock door
+            strTopic = "unlock";
+            if (iAction == 1) {newState = STATE_UNLOCK_DOOR;}
+            if (iAction == 2) {newState = STATE_UNLOCK_DOOR;}
+            iOutcome = 2;
+            strOutcome = 2;
+            break;
+
+          case 7: // Toggle do not disturb
+            strTopic = "auto_unlock";
+            if (iAction < 2) {muteBellEnabled = iAction;}
+            if (iAction == 2) {muteBellEnabled = !muteBellEnabled;}
+            iOutcome = muteBellEnabled;
+            if (iOutcome == 0) {strOutcome = "OFF";}
+            else if(iOutcome == 1) {strOutcome = "ON";}
+            break;
+        }
+        /*
         switch(command) {
           case 1: // Unlock the door
             DEBUG_PRINTLN("Action triggered unlock");
@@ -507,11 +558,13 @@ void loop(void) {
           default:
             newState = STATE_IDLE;
           break;
+        */
 
-        }
         DEBUG_PRINT("Command put in serout buffer: ");
-        DEBUG_PRINTLN(command);
-        prevState = STATE_HANDLE_ACTION;
+        DEBUG_PRINTLN(iCommand);
+        DEBUG_PRINTLN(strTopic);
+        DEBUG_PRINTLN(strAction);
+        DEBUG_PRINTLN(muteBellEnabled);
       break;
     }
 }
@@ -593,6 +646,7 @@ boolean formValidator()
 
   return valid;
 }
+
 
 boolean connectMqtt() {
   unsigned long now = millis();
