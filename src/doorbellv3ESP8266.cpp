@@ -459,7 +459,7 @@ void loop(void) {
         commandBuff.push(69); // Ringer
         commandBuff.push(79); // Mute
         commandBuff.push(89); // Auto_unlocker
-        commandBuff.push(9); // Rotary input
+        commandBuff.push(90); // Rotary input
       break;
 
       // State 7 - Handle actio
