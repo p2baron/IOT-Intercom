@@ -1,10 +1,14 @@
 /*
- * TODO
- * make code work
- * watchdog https://techtutorialsx.com/2017/01/21/esp8266-watchdog-functions/
- *  ESP.wdtEnable(1000); / ESP.wdtFeed();
- * wifimanager
- * mqtt
+TODO
+- Re-arrange numbers /actions / topics
+- Code cleanup
+- Reset auto inlock for an hour or so
+
+
+Nice to have:
+- Counter to stores number of rings and door opens
+- NTP Time TIme??
+- MQTT configurable variabels
   */
 
 //Libs
@@ -14,11 +18,10 @@
 #include <ESP8266WiFi.h>
 #include <Ticker.h>
 #include <MQTT.h>
-#include <IotWebConf.h>
+#include <IotWebConf.h> // by Prampec https://github.com/prampec/IotWebConf
 
 #define DEBUG
 #define SERIAL_COMMANDS
-
 
 #ifdef DEBUG
  #define DEBUG_PRINT(x)     Serial.print (x)
@@ -31,10 +34,6 @@
 #endif
 
 
-/* pins
-Not all pins can be used as input. Check
-https://randomnerdtutorials.com/esp8266-pinout-reference-gpios/
-*/
 // Output PINS
 #define HB_INA D3 // H-Bridge INA
 #define HB_INB D4 // H-Bridge INB
@@ -46,18 +45,20 @@ https://randomnerdtutorials.com/esp8266-pinout-reference-gpios/
 #define ROTARY_PULSE_PIN D1 // Input for the rotary dailer pulse pin (normally closed
 #define ROTARY_READY_PIN D2 // Input pin for rotary dailer ready pin (normally open)
 
-
 #define BAUDRATE 115200
-#define RINGER_PERIOD 25000 //in us (microsecond) blink once a second = 25000us = 25ms
+#define RINGER_SLOW_PERIOD_MS 50 //  20hz = 50ms cycle, 25hz = 40ms
+#define RINGER_FAST_PERIOD_MS 40 //  20hz = 50ms cycle, 25hz = 40ms
 #define DOOR_UNLOCK_DURATION 150
 
-#define INT_CHECK_INTERVAL_MS 20
-#define INT_MIN_STABLE_VALS 6
+#define CHECK_INTERVAL_MS 20
+#define MIN_STABLE_VALS 6
+
+#define MQTT_UPDATE_INTERVAL_MS 30000
 
 void silenceBell();
 void handler_ringer(void);
 void buzzerButtonInterrupt();
-void doorBelInterrupt();
+void doorBellInterrupt();
 void handleRoot();
 void wifiConnected();
 void configSaved();
@@ -65,10 +66,8 @@ boolean formValidator();
 boolean connectMqtt();
 void mqttMessageReceived(String &topic, String &payload);
 
-
 unsigned long prevIntCheckMillis;
 char buzzerButtonStableVals, octoPinStableVals;
-
 
 // Classes and things
 RotaryDialer dialer = RotaryDialer(ROTARY_READY_PIN, ROTARY_PULSE_PIN);
@@ -77,14 +76,16 @@ CircularBuffer<int, 10> commandBuff;
 Ticker bellTimer;
 
 enum programStates {
+  STATE_RESET, // Reset
   STATE_INIT, // Initialise
   STATE_IDLE, // Idle
   STATE_ROTARY_INPUT,
   STATE_RING_BELL,
+  STATE_SHORT_RING_BELL,
   STATE_UNLOCK_DOOR,
   //STATE_DOORBELL_PRESSED,
   STATE_SERIAL_INPUT,
-  STATE_SERIAL_OUTPUT,
+  STATE_MQTT_UPDATE,
   STATE_HANDLE_ACTION
 };
 
@@ -106,11 +107,12 @@ unsigned long stateTime = 0;
 unsigned long prevStateTime = 0;
 
 boolean doorBellIntFlag = false;
-boolean autoUnlockFlag = false;
+boolean doorBellPressed = false;
 
+boolean autoUnlockFlag = false;
 boolean autoUnlockEnabled = false;
+
 boolean buzzerPressedFlag = false;
-//boolean autoOpenEnabled = false;
 boolean muteBellEnabled = false;
 
 unsigned int dialerInput = 0;
@@ -119,17 +121,20 @@ boolean bellOn = false;
 
 //Put ISR's in IRAM.
 void ICACHE_RAM_ATTR buzzerButtonInterrupt();
-void ICACHE_RAM_ATTR doorBelInterrupt();
+void ICACHE_RAM_ATTR doorBellInterrupt();
 
 
 // Wifi stuff
-const char thingName[] = "doorbell";
+const char thingName[] = "iot-intercom";
 const char wifiInitialApPassword[] = "10doorbell10!";
 #define STRING_LEN 128
-#define CONFIG_VERSION "mqttdoorbell v3.1ESP"
+#define CONFIG_VERSION "MQTT Intercom v3.20200131 ESP "
 #define STATUS_PIN LED_BUILTIN
 
-#define MQTT_TOPIC_PREFIX "/devices/"
+#define MQTT_ACTION_TOPIC_PREFIX "cmnd/"
+#define MQTT_STATUS_TOPIC_PREFIX "stat/"
+#define MQTT_TELEMETRY_TOPIC_PREFIX "tele/"
+
 #define ACTION_FEQ_LIMIT 7000
 #define NO_ACTION -1
 
@@ -148,7 +153,8 @@ MQTTClient mqttClient;
 char mqttServerValue[STRING_LEN];
 char mqttUserNameValue[STRING_LEN];
 char mqttUserPasswordValue[STRING_LEN];
-
+char mqttActionTopic[STRING_LEN];
+char mqttStatusTopic[STRING_LEN];
 
 IotWebConf iotWebConf(thingName, &dnsServer, &server, wifiInitialApPassword, CONFIG_VERSION);
 IotWebConfParameter mqttServerParam = IotWebConfParameter("MQTT server", "mqttServer", mqttServerValue, STRING_LEN);
@@ -157,13 +163,10 @@ IotWebConfParameter mqttUserPasswordParam = IotWebConfParameter("MQTT password",
 boolean needMqttConnect = false;
 boolean needReset = false;
 unsigned long lastMqttConnectionAttempt = 0;
+unsigned long lastMqttUpdateTimeMS = 0;
 int needAction = NO_ACTION;
 int state = LOW;
 unsigned long lastAction = 0;
-
-
-char mqttActionTopic[STRING_LEN];
-char mqttStatusTopic[STRING_LEN];
 
 
 void setup(void) {
@@ -177,11 +180,9 @@ void setup(void) {
   pinMode(LED_BUILTIN, OUTPUT);
   pinMode(OCTO_COUPLER_PIN, INPUT_PULLUP); // When low input
   pinMode(BUZZER_BUTTON_PIN, INPUT_PULLUP); // When low input
-  attachInterrupt(digitalPinToInterrupt(OCTO_COUPLER_PIN), doorBelInterrupt, FALLING);
-  attachInterrupt(digitalPinToInterrupt(BUZZER_BUTTON_PIN), buzzerButtonInterrupt, RISING);
+  attachInterrupt(digitalPinToInterrupt(OCTO_COUPLER_PIN), doorBellInterrupt, FALLING);
+  attachInterrupt(digitalPinToInterrupt(BUZZER_BUTTON_PIN), buzzerButtonInterrupt, FALLING);
   // Webserver
-  //iotWebConf.setStatusPin(STATUS_PIN);
-  //iotWebConf.setConfigPin(BUTTON_PIN);
   iotWebConf.addParameter(&mqttServerParam);
   iotWebConf.addParameter(&mqttUserNameParam);
   iotWebConf.addParameter(&mqttUserPasswordParam);
@@ -204,19 +205,8 @@ void setup(void) {
   server.on("/config", []{ iotWebConf.handleConfig(); });
   server.onNotFound([](){ iotWebConf.handleNotFound(); });
 
-  // -- Prepare dynamic topic names
-  String temp = String(MQTT_TOPIC_PREFIX);
-  temp += iotWebConf.getThingName();
-  temp += "/action";
-  temp.toCharArray(mqttActionTopic, STRING_LEN);
-  temp = String(MQTT_TOPIC_PREFIX);
-  temp += iotWebConf.getThingName();
-  temp += "/status";
-  temp.toCharArray(mqttStatusTopic, STRING_LEN);
-
   mqttClient.begin(mqttServerValue, net);
   mqttClient.onMessage(mqttMessageReceived);
-
   DEBUG_PRINTLN("Setup finished");
 }
 
@@ -228,22 +218,31 @@ void loop(void) {
     DEBUG_PRINTLN(newState);
   }
     switch(newState) { // Initialisation
+      // STATE 0 - RESET
+      case STATE_RESET:
+        prevState = STATE_RESET;
+        newState = STATE_IDLE; //
+        DEBUG_PRINTLN("Rebooting after 1 second.");
+        iotWebConf.delay(1000);
+        ESP.restart();
+        // Save data?
+      break;
+
       // STATE 0 - Init
       case STATE_INIT: // Basically the same as setup.
+        prevState = STATE_INIT;
+        newState = STATE_IDLE;
         serOutBuff.clear();
         commandBuff.clear();
         // Configure timer
         // https://circuits4you.com/2018/01/02/esp8266-timer-ticker-example/
-        bellTimer.attach_ms(50, handler_ringer); // 20hz = 50ms cycle, 25hz = 40ms
+        //bellTimer.attach_ms(RINGER_PERIOD_MS, handler_ringer); // 20hz = 50ms cycle, 25hz = 40ms
         silenceBell();
         dialer.setup();
-        prevState = STATE_INIT;
-        newState = STATE_IDLE;
       break;
 
       // STATE 1 - Idle
       case STATE_IDLE:
-        //iwdg_feed(); // reset watchdog
         iotWebConf.doLoop();
         mqttClient.loop();
         if (needMqttConnect) {
@@ -252,14 +251,18 @@ void loop(void) {
           }
         }
         else if ((iotWebConf.getState() == IOTWEBCONF_STATE_ONLINE) && (!mqttClient.connected())) {
-          DEBUG_PRINTLN("MQTT reconnect");
           connectMqtt();
         }
 
+        if (mqttClient.connected()) {
+            if ((stateTime - lastMqttUpdateTimeMS) > MQTT_UPDATE_INTERVAL_MS) {
+              lastMqttUpdateTimeMS = stateTime;
+              newState = STATE_MQTT_UPDATE;
+            }
+        }
+
         if (needReset) {
-          DEBUG_PRINTLN("Rebooting after 1 second.");
-          iotWebConf.delay(1000);
-          ESP.restart();
+          newState = STATE_RESET;
         }
 
         if (dialer.update()) {
@@ -270,9 +273,6 @@ void loop(void) {
           newState = STATE_HANDLE_ACTION;
         }
 
-        if (!serOutBuff.isEmpty()) { // We have stuff ready for transmission
-          newState = STATE_SERIAL_OUTPUT;
-        }
 
         #ifdef DEBUG
           if (Serial.available() > 0) {
@@ -281,19 +281,18 @@ void loop(void) {
         #endif
 
         // Debouncing of interrupts
-        if ((stateTime - prevIntCheckMillis) > INT_CHECK_INTERVAL_MS) {
+        if ((stateTime - prevIntCheckMillis) > CHECK_INTERVAL_MS) {
           prevIntCheckMillis = stateTime;
-          // Buzzerbutton debounde
-          if ((digitalRead(BUZZER_BUTTON_PIN) == HIGH) && (buzzerPressedFlag == true))
+          // Buzzerbutton debounce
+          if ((digitalRead(BUZZER_BUTTON_PIN) == LOW) && (buzzerPressedFlag == true))
           {
             buzzerButtonStableVals++;
-            if (buzzerButtonStableVals >= INT_MIN_STABLE_VALS)
+            if (buzzerButtonStableVals >= MIN_STABLE_VALS)
             {
+              commandBuff.push(11); // Notify buzzer button pressed
               buzzerPressedFlag = false;
-              serOutBuff.push(10);
               newState = STATE_UNLOCK_DOOR;
               buzzerButtonStableVals = 0;
-              DEBUG_PRINTLN("Interrupt triggered unlock");
             }
           }
           else {
@@ -303,11 +302,19 @@ void loop(void) {
           if ((digitalRead(OCTO_COUPLER_PIN) == LOW) && (doorBellIntFlag == true))
           {
             octoPinStableVals++;
-            if (octoPinStableVals >= INT_MIN_STABLE_VALS)
+            if (octoPinStableVals >= MIN_STABLE_VALS)
             {
               doorBellIntFlag = false;
-              serOutBuff.push(20);
-              newState = STATE_RING_BELL;
+              doorBellPressed = true;
+              if (autoUnlockEnabled == true) {
+                commandBuff.push(21); // Notify doorbellbutton is pressed
+                commandBuff.push(51); // Open door
+                commandBuff.push(22); // Notify auto unlock
+              }
+              else {
+                commandBuff.push(21); // Notify doorbellbutton is pressed
+              }
+              commandBuff.push(61); // Ring bell
               octoPinStableVals = 0;
             }
           }
@@ -315,7 +322,6 @@ void loop(void) {
             octoPinStableVals = 0;
           }
         }
-
         prevState = STATE_IDLE;
       break;
 
@@ -326,23 +332,29 @@ void loop(void) {
         dialerInput = dialer.getNextNumber();
 
         switch(dialerInput){
+          /*
           case 1:
             commandBuff.push(1);
           break;
-          case 6:
-            commandBuff.push(6);
-          break;
+
           case 7:
             commandBuff.push(7);
           break;
-          case 8: // Toggle do not disturb
-            commandBuff.push(8);
+          */
+          case 9: // Switch auto open off
+            commandBuff.push(80);
+            commandBuff.push(41);
           break;
-          case 9: // Toggle auto open mode
-            commandBuff.push(9);
+
+          case 6: // Ring bell
+            commandBuff.push(61);
+          break;
+          case 8: // Switch auto open on
+            commandBuff.push(81);
+            commandBuff.push(41);
           break;
           default:
-            serOutBuff.push(dialerInput);
+            commandBuff.push(90 +dialerInput);
           break;
         }
       break;
@@ -350,69 +362,79 @@ void loop(void) {
       //State 3 - Unlock door
       case STATE_UNLOCK_DOOR: // Activate relay to open door
         if (prevState != STATE_UNLOCK_DOOR) {
-          DEBUG_PRINTLN("Relay ON");
+          DEBUG_PRINTLN("STATE_UNLOCK_DOOR");
           silenceBell();
           prevStateTime = stateTime;
           digitalWrite(REED_RELAY_PIN, HIGH);
         }
         if((stateTime - prevStateTime) >= DOOR_UNLOCK_DURATION) {
-          DEBUG_PRINTLN("Relay OFF");
           digitalWrite(REED_RELAY_PIN, LOW);
           newState = STATE_IDLE;
         }
+
+        if (doorBellPressed == true && autoUnlockEnabled == false) {
+          commandBuff.push(20); // Notify that we answered the doorbell and buzzed vistor in.
+        }
+
         prevState = STATE_UNLOCK_DOOR;
       break;
 
       //State 4 - Ring bell
       case STATE_RING_BELL:
-        if(muteBellEnabled == true && autoUnlockEnabled == false) { // Dont ring the bell when we are on mute. But do if auto open is enabled
-          newState = STATE_IDLE;
-          prevState = STATE_RING_BELL;
-          break;
-        }
-        if(prevState!=STATE_RING_BELL) {
-          DEBUG_PRINTLN("Bell on INIT");
+        normalBellRing.onTimeMs = 1000;
+        normalBellRing.offTimeMs = 500;
+        normalBellRing.repeats = 3;
+
+        if(prevState!=STATE_RING_BELL) { // First time here
           bellOn = true;
-          //Timer2.resume();
-          bellTimer.attach_ms(50, handler_ringer);
+          bellTimer.attach_ms(RINGER_SLOW_PERIOD_MS, handler_ringer);
           bellRepeats = 1;
           prevStateTime = stateTime;
         }
         if (bellOn == true) {
           if((stateTime - prevStateTime) > normalBellRing.onTimeMs) {
-            DEBUG_PRINT("Bell off: ");
-            DEBUG_PRINTLN(bellRepeats);
             silenceBell();
             prevStateTime = stateTime;
             bellOn = false;
             prevStateTime = stateTime;
             if (bellRepeats >= normalBellRing.repeats) {
-                if (autoUnlockFlag == true) {
-                  autoUnlockFlag = false;
-                  newState = STATE_UNLOCK_DOOR;
-                  DEBUG_PRINTLN("Auto unlock from RING_BELL_STATE triggered unlock");
-                }
-                else {
-                  newState = STATE_IDLE;
-                }
-            }
+                newState = STATE_IDLE;
+              }
           }
         }
         else if((stateTime  - prevStateTime) > normalBellRing.offTimeMs) {
             DEBUG_PRINT("Bell on: ");
             DEBUG_PRINTLN(bellRepeats);
             bellRepeats++;
-            //Timer2.resume();
-            bellTimer.attach_ms(50, handler_ringer);
+            bellTimer.attach_ms(RINGER_SLOW_PERIOD_MS, handler_ringer);
             prevStateTime = stateTime;
             bellOn = true;
           }
         prevState = STATE_RING_BELL;
       break;
 
+      case STATE_SHORT_RING_BELL:
+      normalBellRing.onTimeMs = 250;
+      if(prevState!=STATE_SHORT_RING_BELL) { // First time here
+        bellOn = true;
+        bellTimer.attach_ms(RINGER_FAST_PERIOD_MS, handler_ringer);
+        bellRepeats = 1;
+        prevStateTime = stateTime;
+      }
+      if (bellOn == true) {
+        if((stateTime - prevStateTime) > normalBellRing.onTimeMs) {
+          silenceBell();
+          prevStateTime = stateTime;
+          bellOn = false;
+          prevStateTime = stateTime;
+          newState = STATE_IDLE;
+        }
+      }
+      prevState = STATE_SHORT_RING_BELL;
+      break;
+
       // State 5 - Serial IN
       case STATE_SERIAL_INPUT:
-
         int input;
         input = Serial.parseInt();
         if (input > 0) {
@@ -424,175 +446,157 @@ void loop(void) {
         newState = STATE_IDLE;
       break;
 
-      // State 6 - Serial OUT
-      case STATE_SERIAL_OUTPUT:
-        //int intOut;
-        //intOut = serOutBuff.shift();
-        newState = STATE_IDLE;
-        prevState = STATE_SERIAL_OUTPUT;
+
+      case STATE_MQTT_UPDATE:
+        prevState = STATE_HANDLE_ACTION;
+        newState = STATE_IDLE; // Don't get trapped in here
+        // Update status (announce  topics)
+        commandBuff.push(19); // Buzzer
+        commandBuff.push(29); // Doorbellbutton
+        commandBuff.push(39); // Reset
+        commandBuff.push(49); // Short ring
+        commandBuff.push(59); // Unlock door
+        commandBuff.push(69); // Ringer
+        commandBuff.push(79); // Mute
+        commandBuff.push(89); // Auto_unlocker
+        commandBuff.push(9); // Rotary input
       break;
 
       // State 7 - Handle actio
       case STATE_HANDLE_ACTION:
         prevState = STATE_HANDLE_ACTION;
-        newState = STATE_IDLE; // Don get trapped in here
+        newState = STATE_IDLE; // Don't get trapped in here
         unsigned int iCommand, iTopic, iAction, iOutcome;
         String strAction = "";
         String strTopic = "";
         String strOutcome = "";
         iCommand = commandBuff.shift();
+
         if(iCommand<10 || iCommand>99) {break;} // We are expecting two digits
         iTopic = (iCommand/10) % 10;
         iAction = (iCommand % 10);
-        switch(iAction) {
-          case 0:
-            strAction = "OFF";
-            break;
-          case 1:
-            strAction = "ON";
-            break;
-          case 2:
-            strAction = "TOGGLE";
-            break;
-          default:
-            strAction = "STATUS";
-            iAction = 9;
-            break;
-      }
+
+        if (iTopic != 9) { // 9 is reservered for rotary output
+          switch(iAction) {
+            case 0:
+              strAction = "OFF";
+              break;
+            case 1:
+              strAction = "ON";
+              break;
+            case 2:
+              strAction = "TOGGLE";
+              break;
+            default:
+              strAction = "STATUS";
+              iAction = 9;
+              break;
+          }
+        }
 
         switch(iTopic) {
-          case 5: // Unlock door
-            strTopic = "unlock";
-            if (iAction == 1) {newState = STATE_UNLOCK_DOOR;}
-            if (iAction == 2) {newState = STATE_UNLOCK_DOOR;}
-            iOutcome = 2;
-            strOutcome = 2;
+          case 1: // Doorbell pressed (MQTT update)
+            strTopic = "BUZZER";
+            if (iAction == 1) {strOutcome = "PRESSED";}
+          break;
+
+          case 2: // Doorbell pressed (MQTT update)
+            strTopic = "DOORBELL";
+            if (iAction == 0) {strOutcome = "ANSWERED";doorBellPressed = false;}
+            if (iAction == 1) {strOutcome = "PRESSED";}
+            if (iAction == 2) {strOutcome = "AUTO_ANSWERED";doorBellPressed = false;}
+          break;
+
+          case 3: // Reset device (action)
+            strTopic = "RESET";
+            if (iAction == 1) {newState = STATE_RESET; strOutcome = "TOGGLE";}
+            if (iAction == 2) {newState = STATE_RESET; strOutcome = "TOGGLE";}
+          break;
+
+          case 4: // Unlock door (action)
+            strTopic = "SHORT_RING";
+            if (iAction == 1) {newState = STATE_SHORT_RING_BELL; strOutcome = "TOGGLE";}
+            if (iAction == 2) {newState = STATE_SHORT_RING_BELL; strOutcome = "TOGGLE";}
             break;
 
-          case 7: // Toggle do not disturb
-            strTopic = "auto_unlock";
+          case 5: // Unlock door (action)
+            strTopic = "UNLOCK";
+            if (iAction == 1) {newState = STATE_UNLOCK_DOOR; strOutcome = "TOGGLE";}
+            if (iAction == 2) {newState = STATE_UNLOCK_DOOR; strOutcome = "TOGGLE";}
+            break;
+
+          case 6: // Ring bell (action)
+            strTopic = "RINGER";
+            if (iAction == 1) {newState = STATE_RING_BELL; strOutcome = "TOGGLE";}
+            if (iAction == 2) {newState = STATE_RING_BELL; strOutcome = "TOGGLE";}
+            break;
+
+          case 7: // Toggle do not disturb (switch)
+            strTopic = "MUTE";
             if (iAction < 2) {muteBellEnabled = iAction;}
             if (iAction == 2) {muteBellEnabled = !muteBellEnabled;}
             iOutcome = muteBellEnabled;
             if (iOutcome == 0) {strOutcome = "OFF";}
             else if(iOutcome == 1) {strOutcome = "ON";}
             break;
-        }
-        /*
-        switch(command) {
-          case 1: // Unlock the door
-            DEBUG_PRINTLN("Action triggered unlock");
-            newState = STATE_UNLOCK_DOOR;
-            serOutBuff.push(command);
-          break;
 
-          case 6: // Ring the bell
-            newState = STATE_RING_BELL;
-            serOutBuff.push(command);
-          break;
-
-          case 7: // Toggle mute
-            if(muteBellEnabled==true) {
-              commandBuff.push(70);
-            }
-            else {
-              commandBuff.push(71);
-            }
-          break;
-
-          case 70: // Disable mute
-            muteBellEnabled = false;
-            serOutBuff.push(70);
-            commandBuff.push(6);
-          break;
-
-          case 71: // Enable mute
-            muteBellEnabled = true;
-            serOutBuff.push(71);
-          break;
-
-          case 72: // Status mute
-            if(muteBellEnabled==true) {
-              serOutBuff.push(70);
-            }
-            else {
-              serOutBuff.push(71);
-            }
+          case 8: // Toggle auto unlock (switch)
+            strTopic = "AUTO_UNLOCKER";
+            if (iAction < 2) {autoUnlockEnabled = iAction;}
+            if (iAction == 2) {autoUnlockEnabled = !autoUnlockEnabled;}
+            iOutcome = autoUnlockEnabled;
+            if (iOutcome == 0) {strOutcome = "OFF";}
+            else if(iOutcome == 1) {strOutcome = "ON";}
             break;
 
-
-          case 8: // Toggle auto unlock
-            if(autoUnlockEnabled==true) {
-              commandBuff.push(80);
-            }
-            else {
-              commandBuff.push(81);
-            }
-          break;
-
-          case 80: // Disable auto unlock
-            autoUnlockEnabled = false;
-            serOutBuff.push(80);
-            commandBuff.push(6);
-          break;
-
-          case 81: // Enable auto unlock
-            autoUnlockEnabled = true;
-            serOutBuff.push(81);
-          break;
-
-          case 82: // Status auto unlock
-            if(autoUnlockEnabled==true) {
-              serOutBuff.push(80);
-            }
-            else {
-              serOutBuff.push(81);
-            }
-          break;
-
-
-          case 9:
-            newState = STATE_INIT;
-          break;
-
-          default:
-            newState = STATE_IDLE;
-          break;
-        */
-
-        DEBUG_PRINT("Command put in serout buffer: ");
-        DEBUG_PRINTLN(iCommand);
-        DEBUG_PRINTLN(strTopic);
-        DEBUG_PRINTLN(strAction);
-        DEBUG_PRINTLN(muteBellEnabled);
+          case 9: // Reset to default (action)
+            strTopic = "ROTARY";
+            strOutcome = iAction;
+            break;
+        }
+        if (mqttClient.connected()) {
+          // -- Prepare dynamic topic names
+          // /stat/iot-intercom/topic
+          if (strOutcome.length() == 0) {
+            strOutcome = "IDLE";
+          }
+          String temp = String(MQTT_STATUS_TOPIC_PREFIX);
+          temp += iotWebConf.getThingName();
+          temp += "/";
+          temp += strTopic;
+          temp.toCharArray(mqttStatusTopic, STRING_LEN);
+          mqttClient.publish(mqttStatusTopic, strOutcome, true, 1);
+          DEBUG_PRINT("MQTT Post to: ");
+          DEBUG_PRINTLN(mqttStatusTopic);
+          DEBUG_PRINT("Value: ");
+          DEBUG_PRINTLN(strOutcome);
+        }
       break;
     }
 }
 
 void silenceBell() {
   bellTimer.detach();
-  //Timer2.pause();
   digitalWrite(HB_INA, LOW);
   digitalWrite(HB_INB, LOW);
 }
 
 void handler_ringer(void) {
+  // Only do this when mute is disabled OR mute is enabled but auto open is engaged.
+  if (muteBellEnabled == false || (muteBellEnabled == true && autoUnlockEnabled == true)) {
     toggle ^= 1;
     digitalWrite(LED_BUILTIN, toggle);
     digitalWrite(HB_INA, toggle);
     digitalWrite(HB_INB, !toggle);
+  }
 }
 // Interrupt routines
 void buzzerButtonInterrupt() { // Interrupt when button to open door is pressed
   buzzerPressedFlag = true;
 }
 
-
-void doorBelInterrupt() { // Interrupt when doorbel is pressed
+void doorBellInterrupt() { // Interrupt when doorbel is pressed
     doorBellIntFlag = true;
-    if (autoUnlockEnabled == true) {
-      autoUnlockFlag = true;
-    }
 }
 
 // Wifi and MQTT
@@ -643,7 +647,6 @@ boolean formValidator()
     mqttServerParam.errorMessage = "Please provide at least 3 characters!";
     valid = false;
   }
-
   return valid;
 }
 
@@ -660,25 +663,64 @@ boolean connectMqtt() {
     lastMqttConnectionAttempt = now;
     return false;
   }
-  DEBUG_PRINTLN("Connected!");
-
+  String temp = String(MQTT_ACTION_TOPIC_PREFIX);
+  temp += iotWebConf.getThingName();
+  temp += "/#";
+  temp.toCharArray(mqttActionTopic, STRING_LEN);
+  DEBUG_PRINTLN(mqttActionTopic);
   mqttClient.subscribe(mqttActionTopic);
-  mqttClient.publish(mqttStatusTopic, state == HIGH ? "ON" : "OFF", true, 1);
-  mqttClient.publish(mqttActionTopic, state == HIGH ? "ON" : "OFF", true, 1);
 
+  // Update status (announce  topics)
+  newState = STATE_HANDLE_ACTION;
+
+  DEBUG_PRINTLN("Connected!");
   return true;
 }
 
 void mqttMessageReceived(String &topic, String &payload)
 {
   DEBUG_PRINTLN("Incoming: " + topic + " - " + payload);
+  int iAction = 0;
+  int iTopic = 0;
 
-  if (topic.endsWith("action"))
-  {
-    needAction = payload.equals("ON") ? HIGH : LOW;
-    if (needAction == state)
-    {
-      needAction = NO_ACTION;
-    }
+  if (topic.endsWith("UNLOCK")) {
+    iTopic = 5;
+  }
+
+  if (topic.endsWith("SHORT_RING")) {
+    iTopic = 4;
+  }
+
+  if (topic.endsWith("RINGER")) {
+    iTopic = 6;
+  }
+
+  if (topic.endsWith("MUTE")) {
+    iTopic = 7;
+  }
+
+  if (topic.endsWith("AUTO_UNLOCKER")) {
+    iTopic = 8;
+  }
+
+  if (topic.endsWith("RESET")) {
+    iTopic = 3;
+  }
+
+  if (topic.endsWith("CMND")) {
+    DEBUG_PRINT("MQTT Integer command (CMND) with value: ");
+    DEBUG_PRINT(payload);
+    DEBUG_PRINT(" int: ");
+    iAction = payload.toInt();
+    DEBUG_PRINTLN(iAction);
+  }
+
+  if (iTopic >= 0) {
+    if (payload.equals("OFF")) {iAction = iTopic * 10;}
+    if (payload.equals("ON")) {iAction = (iTopic * 10) + 1;}
+    if (payload.equals("TOGGLE")) {iAction = (iTopic * 10) + 2;}
+  }
+  if (iAction>=0) {
+    commandBuff.push(iAction);
   }
 }
