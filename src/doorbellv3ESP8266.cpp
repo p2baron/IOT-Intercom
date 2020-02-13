@@ -20,7 +20,7 @@ Nice to have:
 #include <MQTT.h>
 #include <IotWebConf.h> // by Prampec https://github.com/prampec/IotWebConf
 
-#define DEBUG
+//#define DEBUG
 #define SERIAL_COMMANDS
 
 #ifdef DEBUG
@@ -565,7 +565,7 @@ void loop(void) {
           temp += "/";
           temp += strTopic;
           temp.toCharArray(mqttStatusTopic, STRING_LEN);
-          mqttClient.publish(mqttStatusTopic, strOutcome, true, 1);
+          mqttClient.publish(mqttStatusTopic, strOutcome, false, 1);
           DEBUG_PRINT("MQTT Post to: ");
           DEBUG_PRINTLN(mqttStatusTopic);
           DEBUG_PRINT("Value: ");
