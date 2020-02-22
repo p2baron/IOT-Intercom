@@ -3,12 +3,12 @@ TODO
 - Re-arrange numbers /actions / topics
 - Code cleanup
 - Reset auto inlock for an hour or so
-
-
-Nice to have:
-- Counter to stores number of rings and door opens
-- NTP Time TIme??
-- MQTT configurable variabels
+- JSON sstructures messages
+- MOre config parameters
+- Counters (in flash)
+- Config in flash?
+- NTP time
+- Error hadnling (no wifi etc)
   */
 
 //Libs
@@ -16,11 +16,15 @@ Nice to have:
 #include <RotaryDialer.h> // https://github.com/markfickett/Rotary-Dial
 #include <CircularBuffer.h> // https://github.com/rlogiacco/CircularBuffer
 #include <ESP8266WiFi.h>
-#include <Ticker.h>
+#include <Ticker.h> // ? https://github.com/esp8266/Arduino/tree/master/libraries/Ticker
 #include <MQTT.h>
-#include <IotWebConf.h> // by Prampec https://github.com/prampec/IotWebConf
+#include <IotWebConf.h> // https://github.com/prampec/IotWebConf
+#include <ArduinoJson.h> // https://github.com/bblanchon/ArduinoJson
+#include <WiFiUdp.h>
+#include <NTPClient.h> // https://github.com/taranais/NTPClient (is modified to return date)
 
-//#define DEBUG
+
+#define DEBUG
 #define SERIAL_COMMANDS
 
 #ifdef DEBUG
@@ -70,10 +74,12 @@ unsigned long prevIntCheckMillis;
 char buzzerButtonStableVals, octoPinStableVals;
 
 // Classes and things
+WiFiUDP ntpUDP;
 RotaryDialer dialer = RotaryDialer(ROTARY_READY_PIN, ROTARY_PULSE_PIN);
 CircularBuffer<int, 10> serOutBuff;
 CircularBuffer<int, 10> commandBuff;
 Ticker bellTimer;
+StaticJsonDocument<200> doc;
 
 enum programStates {
   STATE_RESET, // Reset
@@ -137,6 +143,9 @@ const char wifiInitialApPassword[] = "10doorbell10!";
 
 #define ACTION_FEQ_LIMIT 7000
 #define NO_ACTION -1
+
+const long utcOffsetInSeconds = 3600;
+NTPClient timeClient(ntpUDP, "europe.pool.ntp.org", utcOffsetInSeconds, 60000);
 
 // -- Callback method declarations.
 void wifiConnected();
@@ -207,6 +216,7 @@ void setup(void) {
 
   mqttClient.begin(mqttServerValue, net);
   mqttClient.onMessage(mqttMessageReceived);
+  timeClient.begin();
   DEBUG_PRINTLN("Setup finished");
 }
 
@@ -245,6 +255,7 @@ void loop(void) {
       case STATE_IDLE:
         iotWebConf.doLoop();
         mqttClient.loop();
+        timeClient.update();
         if (needMqttConnect) {
           if (connectMqtt()) {
             needMqttConnect = false;
@@ -450,16 +461,17 @@ void loop(void) {
       case STATE_MQTT_UPDATE:
         prevState = STATE_HANDLE_ACTION;
         newState = STATE_IDLE; // Don't get trapped in here
-        // Update status (announce  topics)
-        commandBuff.push(19); // Buzzer
-        commandBuff.push(29); // Doorbellbutton
-        commandBuff.push(39); // Reset
-        commandBuff.push(49); // Short ring
-        commandBuff.push(59); // Unlock door
-        commandBuff.push(69); // Ringer
-        commandBuff.push(79); // Mute
-        commandBuff.push(89); // Auto_unlocker
-        commandBuff.push(90); // Rotary input
+        //doc["sensor"] = "gps";
+        //doc["sensor"] = "gps";
+        doc["BUZZER"] = ""; //RESET
+        doc["DOORBELL"] = "";
+        doc["RESET"] = "";
+        doc["SHORT_RING"] = "";
+        doc["ROTARY"] = "";
+        doc["UNLOCK"] = "";
+        doc["RINGER"] = "";
+        doc["MUTE"] = (muteBellEnabled == true ? "ON" : "OFF");
+        doc["AUTO_UNLOCKER"] = "";
       break;
 
       // State 7 - Handle actio
@@ -570,6 +582,8 @@ void loop(void) {
           DEBUG_PRINTLN(mqttStatusTopic);
           DEBUG_PRINT("Value: ");
           DEBUG_PRINTLN(strOutcome);
+          DEBUG_PRINTLN(timeClient.getFormattedTime());
+          DEBUG_PRINTLN(timeClient.getFormattedDate());
         }
       break;
     }
