@@ -17,12 +17,11 @@ TODO
 #include <CircularBuffer.h> // https://github.com/rlogiacco/CircularBuffer
 #include <ESP8266WiFi.h>
 #include <Ticker.h> // ? https://github.com/esp8266/Arduino/tree/master/libraries/Ticker
-#include <MQTT.h>
-#include <IotWebConf.h> // https://github.com/prampec/IotWebConf
-#include <ArduinoJson.h> // https://github.com/bblanchon/ArduinoJson
 #include <WiFiUdp.h>
 #include <NTPClient.h> // https://github.com/taranais/NTPClient (is modified to return date)
-
+#include <ESP8266HTTPClient.h>
+#include <ESP8266mDNS.h>
+#include <DNSServer.h>
 
 #define DEBUG
 #define SERIAL_COMMANDS
@@ -57,18 +56,18 @@ TODO
 #define CHECK_INTERVAL_MS 20
 #define MIN_STABLE_VALS 6
 
-#define MQTT_UPDATE_INTERVAL_MS 30000
+//#define MQTT_UPDATE_INTERVAL_MS 30000
 
 void silenceBell();
 void handler_ringer(void);
 void buzzerButtonInterrupt();
 void doorBellInterrupt();
-void handleRoot();
-void wifiConnected();
-void configSaved();
-boolean formValidator();
-boolean connectMqtt();
-void mqttMessageReceived(String &topic, String &payload);
+//void handleRoot();
+//void wifiConnected();
+//void configSaved();
+//boolean formValidator();
+//boolean connectMqtt();
+//void mqttMessageReceived(String &topic, String &payload);
 
 unsigned long prevIntCheckMillis;
 char buzzerButtonStableVals, octoPinStableVals;
@@ -79,7 +78,7 @@ RotaryDialer dialer = RotaryDialer(ROTARY_READY_PIN, ROTARY_PULSE_PIN);
 CircularBuffer<int, 10> serOutBuff;
 CircularBuffer<int, 10> commandBuff;
 Ticker bellTimer;
-StaticJsonDocument<200> doc;
+//StaticJsonDocument<200> doc;
 
 enum programStates {
   STATE_RESET, // Reset
@@ -129,53 +128,13 @@ boolean bellOn = false;
 void ICACHE_RAM_ATTR buzzerButtonInterrupt();
 void ICACHE_RAM_ATTR doorBellInterrupt();
 
-
-// Wifi stuff
-const char thingName[] = "iot-intercom";
-const char wifiInitialApPassword[] = "10doorbell10!";
-#define STRING_LEN 128
-#define CONFIG_VERSION "MQTT Intercom v3.20200131 ESP "
-#define STATUS_PIN LED_BUILTIN
-
-#define MQTT_ACTION_TOPIC_PREFIX "cmnd/"
-#define MQTT_STATUS_TOPIC_PREFIX "stat/"
-#define MQTT_TELEMETRY_TOPIC_PREFIX "tele/"
-
-#define ACTION_FEQ_LIMIT 7000
-#define NO_ACTION -1
-
 const long utcOffsetInSeconds = 3600;
 NTPClient timeClient(ntpUDP, "europe.pool.ntp.org", utcOffsetInSeconds, 60000);
+//WiFiClient net;
 
-// -- Callback method declarations.
-void wifiConnected();
-void configSaved();
-boolean formValidator();
-void mqttMessageReceived(String &topic, String &payload);
-
-DNSServer dnsServer;
-WebServer server(80);
-HTTPUpdateServer httpUpdater;
-WiFiClient net;
-MQTTClient mqttClient;
-
-char mqttServerValue[STRING_LEN];
-char mqttUserNameValue[STRING_LEN];
-char mqttUserPasswordValue[STRING_LEN];
-char mqttActionTopic[STRING_LEN];
-char mqttStatusTopic[STRING_LEN];
-
-IotWebConf iotWebConf(thingName, &dnsServer, &server, wifiInitialApPassword, CONFIG_VERSION);
-IotWebConfParameter mqttServerParam = IotWebConfParameter("MQTT server", "mqttServer", mqttServerValue, STRING_LEN);
-IotWebConfParameter mqttUserNameParam = IotWebConfParameter("MQTT user", "mqttUser", mqttUserNameValue, STRING_LEN);
-IotWebConfParameter mqttUserPasswordParam = IotWebConfParameter("MQTT password", "mqttPass", mqttUserPasswordValue, STRING_LEN, "password");
-boolean needMqttConnect = false;
 boolean needReset = false;
-unsigned long lastMqttConnectionAttempt = 0;
-unsigned long lastMqttUpdateTimeMS = 0;
-int needAction = NO_ACTION;
-int state = LOW;
-unsigned long lastAction = 0;
+//int state = LOW;
+//unsigned long lastAction = 0;
 
 
 void setup(void) {
@@ -191,31 +150,6 @@ void setup(void) {
   pinMode(BUZZER_BUTTON_PIN, INPUT_PULLUP); // When low input
   attachInterrupt(digitalPinToInterrupt(OCTO_COUPLER_PIN), doorBellInterrupt, FALLING);
   attachInterrupt(digitalPinToInterrupt(BUZZER_BUTTON_PIN), buzzerButtonInterrupt, FALLING);
-  // Webserver
-  iotWebConf.addParameter(&mqttServerParam);
-  iotWebConf.addParameter(&mqttUserNameParam);
-  iotWebConf.addParameter(&mqttUserPasswordParam);
-  iotWebConf.setConfigSavedCallback(&configSaved);
-  iotWebConf.setFormValidator(&formValidator);
-  iotWebConf.setWifiConnectionCallback(&wifiConnected);
-  iotWebConf.setupUpdateServer(&httpUpdater);
-
-  // -- Initializing the configuration.
-  boolean validConfig = iotWebConf.init();
-  if (!validConfig)
-  {
-    mqttServerValue[0] = '\0';
-    mqttUserNameValue[0] = '\0';
-    mqttUserPasswordValue[0] = '\0';
-  }
-
-  // -- Set up required URL handlers on the web server.
-  server.on("/", handleRoot);
-  server.on("/config", []{ iotWebConf.handleConfig(); });
-  server.onNotFound([](){ iotWebConf.handleNotFound(); });
-
-  mqttClient.begin(mqttServerValue, net);
-  mqttClient.onMessage(mqttMessageReceived);
   timeClient.begin();
   DEBUG_PRINTLN("Setup finished");
 }
@@ -233,7 +167,6 @@ void loop(void) {
         prevState = STATE_RESET;
         newState = STATE_IDLE; //
         DEBUG_PRINTLN("Rebooting after 1 second.");
-        iotWebConf.delay(1000);
         ESP.restart();
         // Save data?
       break;
@@ -253,24 +186,8 @@ void loop(void) {
 
       // STATE 1 - Idle
       case STATE_IDLE:
-        iotWebConf.doLoop();
-        mqttClient.loop();
-        timeClient.update();
-        if (needMqttConnect) {
-          if (connectMqtt()) {
-            needMqttConnect = false;
-          }
-        }
-        else if ((iotWebConf.getState() == IOTWEBCONF_STATE_ONLINE) && (!mqttClient.connected())) {
-          connectMqtt();
-        }
 
-        if (mqttClient.connected()) {
-            if ((stateTime - lastMqttUpdateTimeMS) > MQTT_UPDATE_INTERVAL_MS) {
-              lastMqttUpdateTimeMS = stateTime;
-              newState = STATE_MQTT_UPDATE;
-            }
-        }
+        timeClient.update();
 
         if (needReset) {
           newState = STATE_RESET;
@@ -461,17 +378,6 @@ void loop(void) {
       case STATE_MQTT_UPDATE:
         prevState = STATE_HANDLE_ACTION;
         newState = STATE_IDLE; // Don't get trapped in here
-        //doc["sensor"] = "gps";
-        //doc["sensor"] = "gps";
-        doc["BUZZER"] = ""; //RESET
-        doc["DOORBELL"] = "";
-        doc["RESET"] = "";
-        doc["SHORT_RING"] = "";
-        doc["ROTARY"] = "";
-        doc["UNLOCK"] = "";
-        doc["RINGER"] = "";
-        doc["MUTE"] = (muteBellEnabled == true ? "ON" : "OFF");
-        doc["AUTO_UNLOCKER"] = "";
       break;
 
       // State 7 - Handle actio
@@ -566,25 +472,6 @@ void loop(void) {
             strOutcome = iAction;
             break;
         }
-        if (mqttClient.connected()) {
-          // -- Prepare dynamic topic names
-          // /stat/iot-intercom/topic
-          if (strOutcome.length() == 0) {
-            strOutcome = "IDLE";
-          }
-          String temp = String(MQTT_STATUS_TOPIC_PREFIX);
-          temp += iotWebConf.getThingName();
-          temp += "/";
-          temp += strTopic;
-          temp.toCharArray(mqttStatusTopic, STRING_LEN);
-          mqttClient.publish(mqttStatusTopic, strOutcome, false, 1);
-          DEBUG_PRINT("MQTT Post to: ");
-          DEBUG_PRINTLN(mqttStatusTopic);
-          DEBUG_PRINT("Value: ");
-          DEBUG_PRINTLN(strOutcome);
-          DEBUG_PRINTLN(timeClient.getFormattedTime());
-          DEBUG_PRINTLN(timeClient.getFormattedDate());
-        }
       break;
     }
 }
@@ -611,130 +498,4 @@ void buzzerButtonInterrupt() { // Interrupt when button to open door is pressed
 
 void doorBellInterrupt() { // Interrupt when doorbel is pressed
     doorBellIntFlag = true;
-}
-
-// Wifi and MQTT
-/**
- * Handle web requests to "/" path.
- */
-void handleRoot()
-{
-  // -- Let IotWebConf test and handle captive portal requests.
-  if (iotWebConf.handleCaptivePortal())
-  {
-    // -- Captive portal request were already served.
-    return;
-  }
-  String s = F("<!DOCTYPE html><html lang=\"en\"><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, user-scalable=no\"/>");
-  s += iotWebConf.getHtmlFormatProvider()->getStyle();
-  s += "<title>IotWebConf 07 MQTT Relay</title></head><body>";
-  s += iotWebConf.getThingName();
-  s += "<div>State: ";
-  s += (state == HIGH ? "ON" : "OFF");
-  s += "</div>";
-  s += "<button type='button' onclick=\"location.href='';\" >Refresh</button>";
-  s += "<div>Go to <a href='config'>configure page</a> to change values.</div>";
-  s += "</body></html>\n";
-
-  server.send(200, "text/html", s);
-}
-
-void wifiConnected()
-{
-  needMqttConnect = true;
-}
-
-void configSaved()
-{
-  DEBUG_PRINTLN("Configuration was updated.");
-  needReset = true;
-}
-
-boolean formValidator()
-{
-  DEBUG_PRINTLN("Validating form.");
-  boolean valid = true;
-
-  int l = server.arg(mqttServerParam.getId()).length();
-  if (l < 3)
-  {
-    mqttServerParam.errorMessage = "Please provide at least 3 characters!";
-    valid = false;
-  }
-  return valid;
-}
-
-
-boolean connectMqtt() {
-  unsigned long now = millis();
-  if (1000 > now - lastMqttConnectionAttempt)
-  {
-    // Do not repeat within 1 sec.
-    return false;
-  }
-  DEBUG_PRINTLN("Connecting to MQTT server...");
-  if (!mqttClient.connect(iotWebConf.getThingName())) {
-    lastMqttConnectionAttempt = now;
-    return false;
-  }
-  String temp = String(MQTT_ACTION_TOPIC_PREFIX);
-  temp += iotWebConf.getThingName();
-  temp += "/#";
-  temp.toCharArray(mqttActionTopic, STRING_LEN);
-  DEBUG_PRINTLN(mqttActionTopic);
-  mqttClient.subscribe(mqttActionTopic);
-
-  // Update status (announce  topics)
-  newState = STATE_HANDLE_ACTION;
-
-  DEBUG_PRINTLN("Connected!");
-  return true;
-}
-
-void mqttMessageReceived(String &topic, String &payload)
-{
-  DEBUG_PRINTLN("Incoming: " + topic + " - " + payload);
-  int iAction = 0;
-  int iTopic = 0;
-
-  if (topic.endsWith("UNLOCK")) {
-    iTopic = 5;
-  }
-
-  if (topic.endsWith("SHORT_RING")) {
-    iTopic = 4;
-  }
-
-  if (topic.endsWith("RINGER")) {
-    iTopic = 6;
-  }
-
-  if (topic.endsWith("MUTE")) {
-    iTopic = 7;
-  }
-
-  if (topic.endsWith("AUTO_UNLOCKER")) {
-    iTopic = 8;
-  }
-
-  if (topic.endsWith("RESET")) {
-    iTopic = 3;
-  }
-
-  if (topic.endsWith("CMND")) {
-    DEBUG_PRINT("MQTT Integer command (CMND) with value: ");
-    DEBUG_PRINT(payload);
-    DEBUG_PRINT(" int: ");
-    iAction = payload.toInt();
-    DEBUG_PRINTLN(iAction);
-  }
-
-  if (iTopic >= 0) {
-    if (payload.equals("OFF")) {iAction = iTopic * 10;}
-    if (payload.equals("ON")) {iAction = (iTopic * 10) + 1;}
-    if (payload.equals("TOGGLE")) {iAction = (iTopic * 10) + 2;}
-  }
-  if (iAction>=0) {
-    commandBuff.push(iAction);
-  }
 }
