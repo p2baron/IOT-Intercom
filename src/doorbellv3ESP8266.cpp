@@ -1,10 +1,9 @@
 /*
 TODO
-- Periodic update of MQTT
 - Code cleanup
-- MOre config parameters
-- Counters (in flash)
-- Config in flash?
+- More configratble parameters (via MQTT/Web)
+- More counters
+- Config/counters in flash
 - Error hadnling (no wifi etc)
   */
 
@@ -21,7 +20,7 @@ TODO
 #include <DNSServer.h>
 #include <Homie.h>
 
-#define DEBUG
+//#define DEBUG
 #define SERIAL_COMMANDS
 
 #ifdef DEBUG
@@ -43,8 +42,8 @@ TODO
 // Input pins
 #define OCTO_COUPLER_PIN D6 // Input to detect when someone ringes the doorbel
 #define BUZZER_BUTTON_PIN D7 // Button to press to open the door
-#define ROTARY_PULSE_PIN D1 // Input for the rotary dailer pulse pin (normally closed
-#define ROTARY_READY_PIN D2 // Input pin for rotary dailer ready pin (normally open)
+#define ROTARY_PULSE_PIN D1 // Input for the rotary dialer pulse pin (normally closed
+#define ROTARY_READY_PIN D2 // Input pin for rotary dialer ready pin (normally open)
 
 #define BAUDRATE 115200
 #define RINGER_SLOW_PERIOD_MS 50 //  20hz = 50ms cycle, 25hz = 40ms
@@ -54,7 +53,7 @@ TODO
 #define CHECK_INTERVAL_MS 20
 #define MIN_STABLE_VALS 6
 
-//#define MQTT_UPDATE_INTERVAL_MS 30000
+#define MQTT_UPDATE_INTERVAL_MS 30000
 
 void silenceBell();
 void handler_ringer(void);
@@ -82,7 +81,7 @@ enum programStates {
   STATE_UNLOCK_DOOR,
   //STATE_DOORBELL_PRESSED,
   STATE_SERIAL_INPUT,
-  STATE_MQTT_PUBLISH,
+  STATE_MQTT_PUBLISH_UPDATE,
   STATE_HANDLE_ACTION
 };
 
@@ -96,6 +95,7 @@ struct bellConfig {
 };
 
 bellConfig normalBellRing = {1000, 500, 3};
+bellConfig shortBellRing = {250, 250, 1};
 
 byte toggle = 0;
 byte intToggle = 1;
@@ -115,12 +115,10 @@ int unlockCount = 0;
 
 boolean buzzerPressedFlag = false;
 
+long lastMqttUpdateTimeMS = 0;
 
 int mqttTimer = 0;
 int autUnlockTimer = 0;
-
-
-
 
 boolean muteBellEnabled = false;
 
@@ -130,6 +128,8 @@ String lastRotaryInputDateTime = "n/a";
 unsigned int bellRepeats = 0;
 boolean bellOn = false;
 
+boolean debugEnabled = true;
+
 //Put ISR's in IRAM.
 void ICACHE_RAM_ATTR buzzerButtonInterrupt();
 void ICACHE_RAM_ATTR doorBellInterrupt();
@@ -138,78 +138,73 @@ const long utcOffsetInSeconds = 3600;
 NTPClient timeClient(ntpUDP, "europe.pool.ntp.org", utcOffsetInSeconds, 60000);
 //WiFiClient net;
 
-boolean needReset = false;
-//int state = LOW;
-//unsigned long lastAction = 0;
-
-
 bool latchNodeInputHandler(const HomieRange & range, const String & property, const String & value) {
-  Homie.getLogger() << "Node input handler. Received on property " << property << " value: " << value;
+  boolean action = false;
   if (property == "unlock" && value == "true") {
     newState = STATE_UNLOCK_DOOR;
-    return true;
+    action = true;
   }
   if (property == "auto-unlock") {
     if (value == "true") {
-      commandBuff.push(171); // Add minutes and comm
-      return true;
+      commandBuff.push(161); // Add minutes and comm
+      action = true;
     }
     else if (value == "false") {
       autoUnlockTimerSec = 0;
-      return true;
+      action = true;
     }
-    return false;
+
   }
   if (property == "auto-unlock-min") {
     int min = value.toInt();
     if (min > 0) {
       autoUnlockTimerSec = (min * 60);
-      return true;
+      action = true;
     }
-    else {
-      return false;
-    }
-    return false;
   }
-  // THre options unlock, auto-unlock -auto-unlock-min
+  if (action == true) {
+    commandBuff.push(941); // Queue MQTT update
+    return true;
+  }
+  return false;
 }
 
 bool bellNodeInputHandler(const HomieRange & range, const String & property, const String & value) {
-  Homie.getLogger() << "Node input handler. Received on property " << property << " value: " << value;
+  boolean action = false;
   if (property == "ring-bell") {
     if (value == "true") {
       commandBuff.push(241); //
-      return true;
+      action = true;
     }
   }
   if (property == "short-ring-bell") {
     if (value == "true") {
       commandBuff.push(251); //
-      return true;
+      action = true;
     }
   }
   if (property == "bell-muted") {
     if (value == "true") {
       commandBuff.push(271); // Enable mute
-      return true;
+      action = true;
     }
     else if (value == "false") {
       commandBuff.push(270); // Disable mute
-      return true;
+      action = true;
     }
   }
   if (property == "bell-repeats") {
     int irep = value.toInt();
     if (irep >= 0 && irep <=10) {
       normalBellRing.repeats = irep;
-      return true;
+      action = true;
     }
   }
   if (property == "bell-offtime-ms") {
     int iOfftime = value.toInt();
     if (iOfftime >= 10 && iOfftime <=10000) {
       normalBellRing.offTimeMs = iOfftime;
-      return true;
+      action = true;
     }
   }
 
@@ -217,15 +212,67 @@ bool bellNodeInputHandler(const HomieRange & range, const String & property, con
     int iOntime = value.toInt();
     if (iOntime >= 10 && iOntime <=10000) {
       normalBellRing.onTimeMs = iOntime;
-      return true;
+      action = true;
     }
+  }
+  if (action == true) {
+    commandBuff.push(941); // Queue MQTT update
+    return true;
+  }
+  return false;
+}
+
+bool systemNodeInputHandler(const HomieRange & range, const String & property, const String & value) {
+  boolean action = false;
+  if (property == "command-input") {
+    int iValue = value.toInt();
+    if (iValue >= 100 && iValue <= 999 ) {
+      commandBuff.push(iValue);
+      action = true;
+    }
+  }
+  if (property == "force-mqtt-update") {
+    if (value == "true") {
+      commandBuff.push(941);
+      action = true;
+    }
+  }
+
+  if (property == "reset") {
+    if (value == "true") {
+      commandBuff.push(951);
+      action = true;
+    }
+  }
+
+  if (property == "set-debug") {
+    if (value == "true") {
+      commandBuff.push(961);
+      action = true;
+    }
+    if (value == "false") {
+      commandBuff.push(960);
+      action = true;
+    }
+  }
+
+  if (property == "factory-reset") {
+    if (value == "reset") {
+      commandBuff.push(999);
+      action = true;
+    }
+  }
+
+  if (action == true) {
+    return true;
   }
   return false;
 }
 
 HomieNode bellNode("bell", "Intercom bell", "Intercom bell", false, 0 , 0, &bellNodeInputHandler);
-HomieNode rotaryNode("rotary", "Rotary dailer", "Input device");
+HomieNode rotaryNode("rotary", "Rotary dialer", "Input device");
 HomieNode latchNode("latch", "Central Entrance Door Latch", "Relay control", false, 0 , 0, &latchNodeInputHandler);
+HomieNode systemNode("system", "System settings", "System setting", false, 0 , 0, &systemNodeInputHandler);
 
 void setup(void) {
   #ifdef DEBUG
@@ -240,9 +287,7 @@ void setup(void) {
   pinMode(BUZZER_BUTTON_PIN, INPUT_PULLUP); // When low input
   attachInterrupt(digitalPinToInterrupt(OCTO_COUPLER_PIN), doorBellInterrupt, FALLING);
   attachInterrupt(digitalPinToInterrupt(BUZZER_BUTTON_PIN), buzzerButtonInterrupt, FALLING);
-  // Homie stuff
-  //Homie_setBrand("iot-doorbell"); // before Homie.setup()
-  Homie_setFirmware("Initial home test", "0.0.1");
+
   //Latch node confi
   latchNode.advertise("unlock").setName("Unlock door").setDatatype("Boolean").setRetained(false).settable();
   latchNode.advertise("auto-unlock").setName("Auto unlock door for 30 min").setDatatype("Boolean").setRetained(false).settable();
@@ -251,7 +296,7 @@ void setup(void) {
   latchNode.advertise("last-unlock").setName("Last unlock time").setDatatype("String").setRetained(true);
   latchNode.advertise("unlocks").setName("Number of unlocks").setDatatype("Integer").setRetained(true);
 
-// Bell node configure
+  // Bell node
   bellNode.advertise("doorbell-pressed").setName("Doorbell is pressed").setDatatype("Boolean").setRetained(false);
   bellNode.advertise("doorbell-pressed-time").setName("Last time doorbell was pressed").setDatatype("String").setRetained(true);
   bellNode.advertise("ring-bell").setName("Short ring the bell").setDatatype("Boolean").setRetained(false).settable();
@@ -261,17 +306,28 @@ void setup(void) {
   bellNode.advertise("bell-ontime-ms").setName("Bell on duration (ms)").setDatatype("Integer").setFormat("10:10000").setRetained(true).settable();
   bellNode.advertise("bell-offtime-ms").setName("Bell off duration (ms)").setDatatype("Integer").setFormat("10:10000").setRetained(true).settable();
 
-  rotaryNode.advertise("rotary-input").setName("Rotary dailer input").setDatatype("Integer").setFormat("0:9").setRetained(false).settable();
+  // Rotary node
+  rotaryNode.advertise("rotary-input").setName("Rotary dialer input").setDatatype("Integer").setFormat("0:9").setRetained(false).settable();
   rotaryNode.advertise("rotary-input-time").setName("Last rotary input timer").setDatatype("String").setRetained(true);
 
-  //Homie.setGlobalInputHandler(globalInputHandler);
+  // System node
+  systemNode.advertise("command-input").setName("MQTT input of commands").setDatatype("Integer").setFormat("100:999").setRetained(false).settable();
+  systemNode.advertise("force-mqtt-update").setName("Force MQTT update").setDatatype("Boolean").setRetained(false).settable();
+  systemNode.advertise("reset").setName("Force reset").setDatatype("Boolean").setRetained(false).settable();
+  systemNode.advertise("set-debug").setName("Debug enabled").setDatatype("Boolean").setRetained(true).settable();
+  systemNode.advertise("factory-reset").setName("Send 'reset' to clear").setDatatype("String").setRetained(false).settable();
+
   timeClient.begin();
+//Homie.setGlobalInputHandler(globalInputHandler);
+  Homie.disableLedFeedback(); // before Homie.setup()
+  Homie.disableLogging(); // before Homie.setup()
+  Homie_setFirmware("IOT Doorbell RC1", "28.02.2020");
   Homie.setup();
   DEBUG_PRINTLN("Setup finished");
 }
 
 void loop(void) {
-Homie.loop();
+  Homie.loop();
   stateTime = millis();
   if (newState != prevState) {
     DEBUG_PRINT(prevState);
@@ -305,9 +361,14 @@ Homie.loop();
       case STATE_IDLE:
         if (Homie.isConfigured()) {
           // The device is configured, in normal mode
-          if (Homie.isConnected()) {
-            // The device is connected
+          if (Homie.isConnected()) { // Device is connected
             timeClient.update(); // Update NTP time
+            if ((stateTime - lastMqttUpdateTimeMS) > MQTT_UPDATE_INTERVAL_MS) {
+              lastMqttUpdateTimeMS = stateTime;
+              commandBuff.push(941); // Queue MQTT update
+              DEBUG_PRINTLN("UPDATE MQTT");
+            }
+
           } else {
             // The device is not connected
           }
@@ -318,7 +379,6 @@ Homie.loop();
         // Handle auto unlcotimer
         if (autoUnlockTimerSec > 0) { // Auto unlock is engaged
           if (autoUnlockEnabled == false) { // Just enbabled
-            //latchNode.setProperty("auto-unlock").send("true");
             autoUnlockEnabled = true;
           }
         }
@@ -329,10 +389,6 @@ Homie.loop();
           }
         }
 
-        if (needReset) {
-          newState = STATE_RESET;
-        }
-
         if (dialer.update()) {
           newState = STATE_ROTARY_INPUT;
         }
@@ -340,7 +396,6 @@ Homie.loop();
         if (!commandBuff.isEmpty()) { // We have actions to do
           newState = STATE_HANDLE_ACTION;
         }
-
 
         #ifdef DEBUG
           if (Serial.available() > 0) {
@@ -458,11 +513,8 @@ Homie.loop();
 
       //State 4 - Ring bell
       case STATE_RING_BELL:
-        normalBellRing.onTimeMs = 1000;
-        normalBellRing.offTimeMs = 500;
-        normalBellRing.repeats = 3;
-
         if(prevState!=STATE_RING_BELL) { // First time here
+          DEBUG_PRINTLN("Entering STATE_RING_BELL");
           bellOn = true;
           bellTimer.attach_ms(RINGER_SLOW_PERIOD_MS, handler_ringer);
           bellRepeats = 1;
@@ -491,15 +543,15 @@ Homie.loop();
       break;
 
       case STATE_SHORT_RING_BELL:
-      normalBellRing.onTimeMs = 250;
       if(prevState!=STATE_SHORT_RING_BELL) { // First time here
+        DEBUG_PRINTLN("Entering STATE_SHORT_RING_BELL");
         bellOn = true;
         bellTimer.attach_ms(RINGER_FAST_PERIOD_MS, handler_ringer);
         bellRepeats = 1;
         prevStateTime = stateTime;
       }
       if (bellOn == true) {
-        if((stateTime - prevStateTime) > normalBellRing.onTimeMs) {
+        if((stateTime - prevStateTime) > shortBellRing.onTimeMs) {
           silenceBell();
           prevStateTime = stateTime;
           bellOn = false;
@@ -523,28 +575,31 @@ Homie.loop();
         newState = STATE_IDLE;
       break;
 
-      case STATE_MQTT_PUBLISH:
-        prevState = STATE_HANDLE_ACTION;
+      case STATE_MQTT_PUBLISH_UPDATE:
+        prevState = STATE_MQTT_PUBLISH_UPDATE;
         newState = STATE_IDLE; // Don't get trapped in here
-        // Updates of values
-        latchNode.setProperty("auto-unlock").send(String(autoUnlockEnabled));
+        // Updates all reatined values
+        latchNode.setProperty("auto-unlock").send((autoUnlockTimerSec > 0) ? "true" : "false");
         latchNode.setProperty("auto-unlock-min").send(String(autoUnlockTimerSec/60));
+
         latchNode.setProperty("last-unlock").send(lastUnlockDateTime);
         latchNode.setProperty("unlocks").send(String(unlockCount));
 
-        bellNode.setProperty("doorbell-pressed-time").send("");
-        bellNode.setProperty("bell-repeats").send("");
-        bellNode.setProperty("bell-ontime-ms").send("");
-        bellNode.setProperty("bell-offtime-ms").send("");
+        bellNode.setProperty("bell-muted").send((muteBellEnabled == true) ? "true" : "false");
+        bellNode.setProperty("doorbell-pressed-time").send(lastRotaryInputDateTime);
+        bellNode.setProperty("bell-repeats").send(String(normalBellRing.repeats));
+        bellNode.setProperty("bell-ontime-ms").send(String(normalBellRing.onTimeMs));
+        bellNode.setProperty("bell-offtime-ms").send(String(normalBellRing.offTimeMs));
 
-        rotaryNode.setProperty("rotary-input-time").send("");
+        rotaryNode.setProperty("rotary-input-time").send(lastRotaryInputDateTime);
       break;
 
       // State 7 - Handle actio
       case STATE_HANDLE_ACTION:
         prevState = STATE_HANDLE_ACTION;
         newState = STATE_IDLE; // Don't get trapped in here
-        unsigned int iCommand, iAction, iProperty, iNode, iOutcome;
+        unsigned int iCommand, iAction, iProperty, iNode;
+        String strDateTime = "n/a";
         String strAction = "";
         String strProperty = "";
         String strNode ="";
@@ -556,13 +611,9 @@ Homie.loop();
         iProperty = (iCommand/10) % 10;
         iAction = (iCommand % 10);
 
-        DEBUG_PRINTLN("Switch COmmand ");
-        DEBUG_PRINT("iNode: ");
-        DEBUG_PRINTLN(iNode);
-        DEBUG_PRINT("iProperty: ");
-        DEBUG_PRINTLN(iProperty);
-        DEBUG_PRINT("iAction: ");
-        DEBUG_PRINTLN(iAction);
+        if (Homie.isConnected()) {
+          strDateTime = timeClient.getFormattedDate();
+        }
 
         switch(iAction) {
           case 0:
@@ -594,7 +645,7 @@ Homie.loop();
             if (iAction == 2) {newState = STATE_UNLOCK_DOOR; strOutcome = "true";}
 
           }
-          if (iProperty == 7){
+          if (iProperty == 6){
             strProperty ="auto-unlock";
             if (iAction == 0) { // Reset timer
               autoUnlockTimerSec = 0;
@@ -612,7 +663,7 @@ Homie.loop();
               strProperty = "auto-unlock-min";
               strOutcome = String(autoUnlockTimerSec/60);
             }
-            if (iAction < 3) {commandBuff.push(173);} // Force update of timer
+            if (iAction < 3) {commandBuff.push(163);} // Force update of timer
           }
           if (Homie.isConnected() && !strOutcome.isEmpty()) {latchNode.setProperty(strProperty).send(strOutcome);}
           break;
@@ -624,9 +675,9 @@ Homie.loop();
             commandBuff.push(293); // Update datetime
           }
           if (iProperty == 4){ //Ring bell
-            strProperty = "short-ring-bell";
-            if (iAction == 1) {newState = STATE_SHORT_RING_BELL; strOutcome = "true";}
-            if (iAction == 2) {newState = STATE_SHORT_RING_BELL; strOutcome = "true";}
+            strProperty = "ring-bell";
+            if (iAction == 1) {newState = STATE_RING_BELL; strOutcome = "true";}
+            if (iAction == 2) {newState = STATE_RING_BELL; strOutcome = "true";}
           }
           if (iProperty == 5){ //Short ring bell
             strProperty = "short-ring-bell";
@@ -641,7 +692,7 @@ Homie.loop();
           }
           if (iProperty == 9){ //Notify doorbell pressed
             strProperty = "doorbell-pressed-time";
-            lastBellPressedDateTime = timeClient.getFormattedDate();
+            lastBellPressedDateTime = strDateTime;
             strProperty = lastRotaryInputDateTime;
           }
 
@@ -656,11 +707,42 @@ Homie.loop();
             }
             if (iProperty == 9){
               strProperty = "rotary-input-time";
-              lastRotaryInputDateTime = timeClient.getFormattedDate();
-              strProperty = lastRotaryInputDateTime;
+              lastRotaryInputDateTime = strDateTime;
+              strOutcome = lastRotaryInputDateTime;
             }
             if (Homie.isConnected()) {rotaryNode.setProperty(strProperty).send(strOutcome);}
           break;
+
+          case 9: // System
+          if (iProperty == 4){
+            strProperty = "force-mqtt-update";
+            if (iAction > 0) {
+              strOutcome = "updating MQTT";
+              newState = STATE_MQTT_PUBLISH_UPDATE;
+            }
+          }
+          if (iProperty == 5){ // STATE_RESET
+            strProperty = "set-debug";
+            if (iAction > 0) {
+              strOutcome = "Resetting now";
+              newState = STATE_RESET;}
+          }
+          if (iProperty == 6){ // STATE_RESET
+            strProperty = "set-debug";
+            if (iAction < 2) {
+              strOutcome = (debugEnabled == true ? "true" : "false");
+              debugEnabled = iAction;
+            }
+          }
+
+          if (iProperty == 9){ // Factory reset
+            strProperty = "factory-reset";
+            if (iAction == 9) {
+              strOutcome = "Factory reset now";
+              Homie.reset();
+            }
+          }
+          if (Homie.isConnected()) {systemNode.setProperty(strProperty).send(strOutcome);}
         }
         break;
     }
