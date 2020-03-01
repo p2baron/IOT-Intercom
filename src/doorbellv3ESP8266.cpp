@@ -20,7 +20,7 @@ TODO
 #include <DNSServer.h>
 #include <Homie.h>
 
-//#define DEBUG
+#define DEBUG
 #define SERIAL_COMMANDS
 
 #ifdef DEBUG
@@ -319,8 +319,9 @@ void setup(void) {
 
   timeClient.begin();
 //Homie.setGlobalInputHandler(globalInputHandler);
-  Homie.disableLedFeedback(); // before Homie.setup()
-  Homie.disableLogging(); // before Homie.setup()
+  Homie.disableResetTrigger(); // <- Because I am using D3 for something else
+  //Homie.disableLedFeedback(); //
+  Homie.disableLogging(); //
   Homie_setFirmware("IOT Doorbell RC1", "28.02.2020");
   Homie.setup();
   DEBUG_PRINTLN("Setup finished");
@@ -362,8 +363,8 @@ void loop(void) {
         if (Homie.isConfigured()) {
           // The device is configured, in normal mode
           if (Homie.isConnected()) { // Device is connected
-            timeClient.update(); // Update NTP time
             if ((stateTime - lastMqttUpdateTimeMS) > MQTT_UPDATE_INTERVAL_MS) {
+              timeClient.update(); // Update NTP time
               lastMqttUpdateTimeMS = stateTime;
               commandBuff.push(941); // Queue MQTT update
               DEBUG_PRINTLN("UPDATE MQTT");
@@ -474,7 +475,7 @@ void loop(void) {
             commandBuff.push(241);
           break;
           case 8: // Add 30 min to auto open timer + double short ring to cofirm on
-            commandBuff.push(171);
+            commandBuff.push(161);
             commandBuff.push(251);
             commandBuff.push(251);
           break;
@@ -484,7 +485,7 @@ void loop(void) {
           break;
 
           default:
-            commandBuff.push(300 +dialerInput);
+            commandBuff.push(310 + dialerInput);
           break;
         }
       break;
